@@ -182,15 +182,59 @@ bool isModifier(uint8_t virtualKey)
   return (modifiers.find(virtualKey) != modifiers.end());
 }
 
+AutoTISInputSourceRef copyActiveSystemKeyboardInputSourceLocked()
+{
+  CFPreferencesAppSynchronize(CFSTR("com.apple.HIToolbox"));
+  CFPropertyListRef selected =
+      CFPreferencesCopyAppValue(CFSTR("AppleSelectedInputSources"), CFSTR("com.apple.HIToolbox"));
+  if (selected && CFGetTypeID(selected) == CFArrayGetTypeID()) {
+    CFArrayRef selectedArr = static_cast<CFArrayRef>(selected);
+    for (CFIndex i = 0; i < CFArrayGetCount(selectedArr); ++i) {
+      CFTypeRef item = CFArrayGetValueAtIndex(selectedArr, i);
+      if (!item || CFGetTypeID(item) != CFDictionaryGetTypeID()) {
+        continue;
+      }
+      CFDictionaryRef dict = static_cast<CFDictionaryRef>(item);
+      CFStringRef kind = static_cast<CFStringRef>(CFDictionaryGetValue(dict, CFSTR("InputSourceKind")));
+      CFStringRef layoutName = static_cast<CFStringRef>(CFDictionaryGetValue(dict, CFSTR("KeyboardLayout Name")));
+      if (kind && layoutName && CFStringCompare(kind, CFSTR("Keyboard Layout"), 0) == kCFCompareEqualTo) {
+        CFStringRef keys[] = {kTISPropertyLocalizedName};
+        CFStringRef values[] = {layoutName};
+        AutoCFDictionary filter(
+            CFDictionaryCreate(
+                nullptr, (const void **)keys, (const void **)values, 1, &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks
+            ),
+            CFRelease
+        );
+        AutoCFArray matches(TISCreateInputSourceList(filter.get(), false), CFRelease);
+        if (matches && CFArrayGetCount(matches.get()) > 0) {
+          TISInputSourceRef matched = (TISInputSourceRef)CFArrayGetValueAtIndex(matches.get(), 0);
+          CFRetain(matched);
+          CFRelease(selected);
+          return AutoTISInputSourceRef(matched, CFRelease);
+        }
+      }
+    }
+  }
+  if (selected) {
+    CFRelease(selected);
+  }
+  return AutoTISInputSourceRef(TISCopyCurrentKeyboardInputSource(), CFRelease);
+}
+
 AutoTISInputSourceRef copyKeyboardLayoutForKeyTranslation()
 {
   std::lock_guard<std::mutex> lock(g_tisMutex);
 
+  AutoTISInputSourceRef inputSource = copyActiveSystemKeyboardInputSourceLocked();
   AutoTISInputSourceRef keyboardLayout(TISCopyCurrentKeyboardLayoutInputSource(), CFRelease);
-  AutoTISInputSourceRef inputSource(TISCopyCurrentKeyboardInputSource(), CFRelease);
 
   const bool inputSourceHasLayout =
       inputSource && TISGetInputSourceProperty(inputSource.get(), kTISPropertyUnicodeKeyLayoutData) != nullptr;
+  if (inputSourceHasLayout) {
+    return inputSource;
+  }
 
   CFBooleanRef isSelectCapable = nullptr;
   if (keyboardLayout) {
@@ -472,11 +516,10 @@ KeyModifierMask OSXKeyState::pollActiveModifiers() const
 
 int32_t OSXKeyState::pollActiveGroup() const
 {
-  AutoTISInputSourceRef keyboardLayout(nullptr, CFRelease);
+  AutoTISInputSourceRef keyboardLayout = copyKeyboardLayoutForKeyTranslation();
   CFDataRef id = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_tisMutex);
-    keyboardLayout = AutoTISInputSourceRef(TISCopyCurrentKeyboardLayoutInputSource(), CFRelease);
     if (keyboardLayout)
       id = (CFDataRef)TISGetInputSourceProperty(keyboardLayout.get(), kTISPropertyInputSourceID);
   }
